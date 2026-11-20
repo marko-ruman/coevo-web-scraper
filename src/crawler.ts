@@ -672,7 +672,7 @@ export async function runIntelligentCrawl(
       category: 'identity',
       title: 'Company Identity, Homepage & About',
       url: finalUrl,
-      source_type: 'custom',
+      source_type: 'website_homepage',
       occurred_at: nowIso,
       content: bucketChunks.identity.join('\n\n---\n\n').slice(0, 14000),
     });
@@ -684,7 +684,7 @@ export async function runIntelligentCrawl(
       category: 'products',
       title: 'Products, Solutions, Pricing & Case Studies',
       url: finalUrl,
-      source_type: 'custom',
+      source_type: 'website_products_proof',
       occurred_at: nowIso,
       content: bucketChunks.product_pricing_proof.join('\n\n---\n\n').slice(0, 15000),
     });
@@ -702,7 +702,7 @@ export async function runIntelligentCrawl(
       category: 'blog',
       title: 'Company Blog Posts & Announcements',
       url: finalUrl,
-      source_type: 'custom',
+      source_type: 'company_blog',
       occurred_at: nowIso,
       content: artLines.join('\n\n---\n\n').slice(0, 14000),
     });
@@ -718,7 +718,7 @@ export async function runIntelligentCrawl(
       category: 'news',
       title: 'Recent External News & Press Coverage',
       url: finalUrl,
-      source_type: 'custom',
+      source_type: 'press_news',
       occurred_at: externalNews[0]?.published_at || nowIso,
       content: `Recent News & Press Mentions:\n\n${newsLines.join('\n\n')}`.slice(0, 10000),
     });

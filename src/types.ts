@@ -83,8 +83,12 @@ export interface ClueStateSyncResult {
   external_id: string;
   formatted_prompt: string;
   memories: any[];
+  state?: Record<string, unknown>;
+  total_memories?: number;
+  total_episodes?: number;
   episodes_ingested: number;
   episodes_replayed: number;
+  queued_jobs?: string[];
   cluestate_error: string | null;
 }
 

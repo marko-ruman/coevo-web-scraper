@@ -55,8 +55,12 @@ export async function syncEpisodesToClueState(
     external_id: config.external_id,
     formatted_prompt: '',
     memories: [],
+    state: {},
+    total_memories: 0,
+    total_episodes: 0,
     episodes_ingested: 0,
     episodes_replayed: 0,
+    queued_jobs: [],
     cluestate_error: null,
   };
 
@@ -134,7 +138,7 @@ export async function syncEpisodesToClueState(
       {
         external_id: config.external_id,
         entity_name: config.entity_name,
-        source_type: ep.source_type || 'custom',
+        source_type: ep.source_type || 'website_scrape',
         source_description: ep.title || ep.key,
         source_record_id: ep.key,
         idempotency_key: idemKey,
@@ -142,6 +146,7 @@ export async function syncEpisodesToClueState(
         occurred_at: ep.occurred_at || new Date().toISOString(),
         meta: { ...(config.meta || {}), category: ep.category || ep.key },
         auto_create_entity: true,
+        queue_on_error: true,
       },
       45000
     );
@@ -150,6 +155,9 @@ export async function syncEpisodesToClueState(
       result.cluestate_synced = true;
       if (ingestRes.data?.entity_id) {
         result.cluestate_entity_id = String(ingestRes.data.entity_id);
+      }
+      if (ingestRes.data?.job_id) {
+        result.queued_jobs?.push(String(ingestRes.data.job_id));
       }
       if (ingestRes.data?.idempotent_replay) {
         result.episodes_replayed++;
@@ -180,8 +188,40 @@ export async function syncEpisodesToClueState(
   if (intelRes.ok && intelRes.data) {
     result.formatted_prompt = intelRes.data.formatted_prompt || '';
     result.memories = Array.isArray(intelRes.data.memories) ? intelRes.data.memories : [];
+    result.state = intelRes.data.state || {};
+    result.total_memories = Number(intelRes.data.total_memories ?? result.memories.length);
+    result.total_episodes = Number(intelRes.data.total_episodes ?? 0);
     if (intelRes.data.entity_id) {
       result.cluestate_entity_id = String(intelRes.data.entity_id);
+    }
+  }
+
+  if (result.cluestate_entity_id) {
+    const entityDetailRes = await httpJson(
+      'GET',
+      `${apiBase}/entities/${encodeURIComponent(result.cluestate_entity_id)}`,
+      config.api_key,
+      undefined,
+      15000
+    );
+    if (entityDetailRes.ok && Array.isArray(entityDetailRes.data?.memories) && result.memories.length > 0) {
+      const byId = new Map<string, any>();
+      for (const m of entityDetailRes.data.memories) {
+        if (m?.id !== undefined && m?.id !== null) {
+          byId.set(String(m.id), m);
+        }
+      }
+      result.memories = result.memories.map((mem) => {
+        const full = mem?.id !== undefined && mem?.id !== null ? byId.get(String(mem.id)) : undefined;
+        if (!full) return mem;
+        return {
+          ...mem,
+          ...(full.evidence !== undefined ? { evidence: full.evidence } : {}),
+          ...(full.judge_note !== undefined ? { judge_note: full.judge_note } : {}),
+          ...(full.status !== undefined ? { status: full.status } : {}),
+          ...(full.updated_at !== undefined ? { updated_at: full.updated_at } : {}),
+        };
+      });
     }
   }
 
