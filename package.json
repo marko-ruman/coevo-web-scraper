@@ -1,0 +1,27 @@
+{
+  "name": "coevo-web-scraper",
+  "version": "1.0.0",
+  "description": "Lightweight, general-purpose async web scraper, Markdown converter, and Brand Kit extractor powered by Playwright and Readability.",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@mozilla/readability": "^0.5.0",
+    "express": "^4.21.2",
+    "jsdom": "^25.0.1",
+    "playwright": "^1.50.1",
+    "turndown": "^7.2.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/jsdom": "^21.1.7",
+    "@types/node": "^22.10.0",
+    "@types/turndown": "^5.0.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
