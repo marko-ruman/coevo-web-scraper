@@ -1,4 +1,5 @@
-FROM mcr.microsoft.com/playwright:v1.50.1-noble
+# Keep base image tag aligned with the pinned playwright version in package.json
+FROM mcr.microsoft.com/playwright:v1.65.1-noble
 
 WORKDIR /app
 
