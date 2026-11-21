@@ -66,32 +66,6 @@ export interface EpisodePayload {
   content: string;
 }
 
-export interface ClueStateSyncConfig {
-  api_key: string;
-  base_url?: string;
-  external_id: string;
-  entity_name: string;
-  entity_type?: string;
-  profile_header?: string;
-  multi_episode?: boolean;
-  meta?: Record<string, unknown>;
-}
-
-export interface ClueStateSyncResult {
-  cluestate_synced: boolean;
-  cluestate_entity_id: string | null;
-  external_id: string;
-  formatted_prompt: string;
-  memories: any[];
-  state?: Record<string, unknown>;
-  total_memories?: number;
-  total_episodes?: number;
-  episodes_ingested: number;
-  episodes_replayed: number;
-  queued_jobs?: string[];
-  cluestate_error: string | null;
-}
-
 export interface ScrapeOptions {
   url: string;
   render_js?: boolean;
@@ -110,7 +84,6 @@ export interface CrawlOptions {
   extract_brand?: boolean;
   render_js?: boolean;
   profile_header?: string;
-  cluestate?: ClueStateSyncConfig;
   callback_url?: string;
   callback_secret?: string;
   callback_meta?: Record<string, unknown>;
@@ -136,7 +109,6 @@ export interface CrawlResult {
   external_news: ArticleItem[];
   episodes: EpisodePayload[];
   source_pages: string[];
-  cluestate?: ClueStateSyncResult;
   duration_ms: number;
 }
 

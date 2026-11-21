@@ -6,7 +6,6 @@ import {
   normalizeUrl,
   resolveRelativeUrl,
 } from './markdown.js';
-import { syncEpisodesToClueState } from './cluestate.js';
 import type {
   ArticleItem,
   BrandKit,
@@ -313,7 +312,7 @@ export async function scrapeSingleUrl(options: ScrapeOptions): Promise<{
 }
 
 /**
- * Full intelligent multi-page crawl + Brand Kit + RSS/Blog + External News + optional ClueState sync
+ * Full intelligent multi-page crawl + Brand Kit + RSS/Blog + External News
  */
 export async function runIntelligentCrawl(
   options: CrawlOptions,
@@ -724,40 +723,11 @@ export async function runIntelligentCrawl(
     });
   }
 
-  // Step 7: Optional ClueState ingestion
-  let cluestateResult = undefined;
-  if (options.cluestate?.api_key) {
-    await report('cluestate', 'running', `Syncing ${Math.max(1, episodes.length)} episode(s) to ClueState...`, 88);
-    cluestateResult = await syncEpisodesToClueState(
-      {
-        ...options.cluestate,
-        profile_header: options.cluestate.profile_header || options.profile_header,
-        meta: {
-          ...(options.cluestate.meta || {}),
-          website: finalUrl,
-          source_pages_count: pagesCrawled.length,
-          ...(brandKit ? { brand_kit: brandKit } : {}),
-        },
-      },
-      episodes
-    );
-    await report(
-      'cluestate',
-      cluestateResult.cluestate_synced ? 'completed' : 'warning',
-      cluestateResult.cluestate_synced
-        ? `Synced ${cluestateResult.episodes_ingested} new / ${cluestateResult.episodes_replayed} replayed episodes (${cluestateResult.memories.length} memories)`
-        : cluestateResult.cluestate_error || 'ClueState sync failed',
-      100
-    );
-  } else {
-    await report('cluestate', 'skipped', 'No ClueState key supplied', 100);
-  }
-
   const combinedMarkdown = episodes
     .map((ep) => `## ${ep.title}\n\n${ep.content}`)
     .join('\n\n==============================\n\n');
 
-  const partial = !homeOk && (externalNews.length > 0 || Boolean(cluestateResult?.cluestate_synced));
+  const partial = !homeOk && externalNews.length > 0;
   const blockedReason = !homeOk
     ? wafCheck.reason || homeError || (homeStatus ? `HTTP ${homeStatus} fetching ${url}` : `Could not connect to ${url}`)
     : null;
@@ -781,7 +751,6 @@ export async function runIntelligentCrawl(
     external_news: externalNews,
     episodes,
     source_pages: Array.from(new Set(sourcePages)),
-    cluestate: cluestateResult,
     duration_ms: Date.now() - started,
   };
 }

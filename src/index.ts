@@ -113,7 +113,7 @@ app.post('/v1/brand', requireSecret, async (req: Request, res: Response) => {
 });
 
 /**
- * POST /v1/crawl — Multi-page smart crawl -> Markdown + Brand Kit + RSS/News + optional ClueState sync
+ * POST /v1/crawl — Multi-page smart crawl -> Markdown + Brand Kit + RSS/News + structured episodes
  */
 app.post('/v1/crawl', requireSecret, async (req: Request, res: Response) => {
   const body = (req.body || {}) as CrawlOptions;
@@ -131,7 +131,6 @@ app.post('/v1/crawl', requireSecret, async (req: Request, res: Response) => {
         { key: 'subpages', label: 'Crawl Key Subpages' },
         { key: 'blog_rss', label: 'Scan Blog & RSS' },
         { key: 'external_news', label: 'Fetch External Press' },
-        { key: 'cluestate', label: 'Sync ClueState Memory' },
       ],
       callbackUrl: body.callback_url,
       callbackSecret: body.callback_secret || API_SECRET,
