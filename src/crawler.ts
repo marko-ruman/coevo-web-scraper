@@ -1,6 +1,19 @@
 import { withPage } from './browser.js';
 import { extractBrandKitFromPage } from './brand.js';
 import {
+  extractNewsArticleLinksFromHtml,
+  extractPeopleAndContactsFromHtml,
+  mergeContactsLists,
+  mergePeopleLists,
+} from './extractors.js';
+import {
+  BUCKET_SYNONYMS,
+  detectSiteLanguage,
+  foldAccents,
+  getGoogleNewsLocale,
+  type DetectedLanguageResult,
+} from './i18n.js';
+import {
   detectWafOrChallenge,
   extractDocumentFromHtml,
   normalizeUrl,
@@ -13,6 +26,8 @@ import type {
   CrawlOptions,
   CrawlResult,
   EpisodePayload,
+  ScrapedContacts,
+  ScrapedPerson,
   ScrapeOptions,
   StepState,
 } from './types.js';
@@ -25,7 +40,8 @@ export type StepReporter = (key: string, status: StepState, detail?: string, pro
 async function fastFetch(
   url: string,
   timeoutMs = 8000,
-  accept = 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+  accept = 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  acceptLanguage = 'en-US,en;q=0.9,*;q=0.7'
 ): Promise<{ ok: boolean; status: number; finalUrl: string; body: string; headers: Record<string, string>; error: string }> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -35,7 +51,7 @@ async function fastFetch(
       headers: {
         'User-Agent': FETCH_UA,
         Accept: accept,
-        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Language': acceptLanguage,
       },
       signal: controller.signal,
     });
@@ -66,44 +82,71 @@ async function fastFetch(
   }
 }
 
-function classifyPageBucket(urlStr: string, anchorText = ''): { bucket: string; score: number } {
-  let path = '/';
+export function classifyPageBucket(urlStr: string, anchorText = ''): { bucket: string; score: number } {
+  let rawPath = '/';
   try {
-    path = new URL(urlStr).pathname.toLowerCase();
+    rawPath = new URL(urlStr).pathname;
   } catch {
-    path = '/';
+    rawPath = '/';
   }
-  const haystack = `${path} ${anchorText.toLowerCase()}`;
 
-  if (/\.(pdf|png|jpe?g|gif|svg|webp|ico|css|js|xml|zip|gz|mp4|woff2?)$/i.test(path)) {
+  const lowerPath = rawPath.toLowerCase();
+  if (/\.(pdf|png|jpe?g|gif|svg|webp|ico|css|js|xml|zip|gz|mp4|woff2?)$/i.test(lowerPath)) {
     return { bucket: 'excluded', score: 0 };
   }
-  if (/\/(login|signin|sign-in|signup|sign-up|register|logout|cart|checkout|account|wp-admin|wp-json|privacy|terms|cookie|legal|gdpr|tag\/|author\/|category\/|page\/\d+)/i.test(path)) {
+  if (/\/(login|signin|sign-in|signup|sign-up|register|logout|cart|checkout|account|wp-admin|wp-json|tag\/|author\/|category\/|kategorie\/|stitek\/|page\/\d+|strana\/\d+)/i.test(lowerPath)) {
     return { bucket: 'excluded', score: 0 };
   }
 
-  const rules: Array<{ name: string; re: RegExp; base: number }> = [
-    { name: 'identity', re: /\b(about|company|who-we-are|our-story|story|mission|team|leadership|founders|careers|overview)\b/i, base: 90 },
-    { name: 'product', re: /\b(product|products|platform|solutions|solution|services|service|features|capabilities|use-cases|sectors|industries|integrations|how-it-works|technology)\b/i, base: 100 },
-    { name: 'pricing', re: /\b(pricing|plans|packages|enterprise|editions)\b/i, base: 95 },
-    { name: 'proof', re: /\b(customers|case-studies|case-study|projects|clients|work|portfolio|testimonials|success-stories|stories)\b/i, base: 92 },
-    { name: 'news_blog', re: /\b(blog|news|newsroom|press|press-releases|updates|changelog|insights|articles|releases|announcements)\b/i, base: 85 },
-  ];
+  const foldedPath = foldAccents(rawPath);
+  const foldedAnchor = foldAccents(anchorText).replace(/[^a-z0-9\s-]+/g, ' ').trim();
+  const pathSegments = foldedPath.split('/').filter(Boolean);
+  const depth = pathSegments.length;
 
-  const depth = path.replace(/^\/|\/$/g, '') ? path.replace(/^\/|\/$/g, '').split('/').length : 0;
   let bestBucket = 'general';
   let bestScore = 10;
 
-  for (const r of rules) {
-    if (r.re.test(haystack)) {
-      let score = r.base - depth * 6;
-      if (depth === 1) score += 12;
-      if (score > bestScore) {
-        bestScore = score;
-        bestBucket = r.name;
+  for (const [bucketName, cfg] of Object.entries(BUCKET_SYNONYMS)) {
+    let bucketScore = 0;
+
+    for (const kw of cfg.keywords) {
+      const cleanKw = kw.replace(/-/g, ' ');
+      const segExact = pathSegments.some((seg) => seg === kw || seg.replace(/_/g, '-') === kw);
+      const segSub = !segExact && kw.length >= 4 && pathSegments.some((seg) => seg.includes(kw));
+
+      if (segExact) {
+        bucketScore = Math.max(bucketScore, cfg.urlScore);
+      } else if (segSub) {
+        bucketScore = Math.max(bucketScore, Math.round(cfg.urlScore * 0.78));
+      }
+
+      if (foldedAnchor) {
+        const anchorWords = foldedAnchor.split(/\s+/);
+        if (foldedAnchor === cleanKw || anchorWords.includes(kw)) {
+          bucketScore = Math.max(bucketScore, cfg.anchorScore + (bucketScore > 0 ? 14 : 38));
+        } else if (cleanKw.length >= 4 && foldedAnchor.includes(cleanKw)) {
+          bucketScore = Math.max(bucketScore, cfg.anchorScore + 26);
+        }
+      }
+    }
+
+    if (bucketScore > 0) {
+      if (bucketName === 'legal') {
+        if (bestBucket === 'general' && bucketScore >= cfg.urlScore) {
+          return { bucket: 'excluded', score: 0 };
+        }
+        continue;
+      }
+
+      let finalScore = bucketScore - Math.max(0, depth - 1) * 5;
+      if (depth === 1) finalScore += 12;
+      if (finalScore > bestScore) {
+        bestScore = finalScore;
+        bestBucket = bucketName;
       }
     }
   }
+
   return { bucket: bestBucket, score: Math.max(1, bestScore) };
 }
 
@@ -200,15 +243,16 @@ async function fetchSitemapUrls(baseOrigin: string, host: string): Promise<strin
   return Array.from(new Set(urls));
 }
 
-async function fetchGoogleNews(companyName: string, host: string, limit = 5): Promise<ArticleItem[]> {
+async function fetchGoogleNews(companyName: string, host: string, limit = 5, langCode?: string): Promise<ArticleItem[]> {
   if (!companyName && !host) return [];
   const query = companyName
     ? host
       ? `"${companyName}" OR ${host}`
       : `"${companyName}"`
     : host;
-  const url = `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=en-US&gl=US&ceid=US:en`;
-  const res = await fastFetch(url, 6000, 'application/rss+xml,application/xml,text/xml');
+  const locale = getGoogleNewsLocale(langCode, host);
+  const url = `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=${encodeURIComponent(locale.hl)}&gl=${encodeURIComponent(locale.gl)}&ceid=${encodeURIComponent(locale.ceid)}`;
+  const res = await fastFetch(url, 6000, 'application/rss+xml,application/xml,text/xml', `${locale.hl},en;q=0.7`);
   if (!res.ok || !res.body) return [];
   return parseRssOrAtomXml(res.body, limit);
 }
@@ -388,6 +432,7 @@ export async function runIntelligentCrawl(
   const wafCheck = detectWafOrChallenge(homeStatus, homeHeaders, homeHtml);
   const homeOk = !wafCheck.blocked && homeStatus >= 200 && homeStatus < 400 && homeHtml.length > 0;
 
+  let detectedLang: DetectedLanguageResult = detectSiteLanguage({ url });
   let title = '';
   let description = '';
   let jsonLd: Record<string, unknown> = {};
@@ -395,6 +440,8 @@ export async function runIntelligentCrawl(
   const sourcePages: string[] = [];
   const articles: ArticleItem[] = [];
   let externalNews: ArticleItem[] = [];
+  const peopleLists: ScrapedPerson[][] = [];
+  const contactLists: ScrapedContacts[] = [];
   const bucketChunks: Record<'identity' | 'product_pricing_proof' | 'news_blog', string[]> = {
     identity: [],
     product_pricing_proof: [],
@@ -414,11 +461,16 @@ export async function runIntelligentCrawl(
     await report('blog_rss', 'skipped', 'Skipped — homepage was blocked/unreachable', 65);
   } else {
     const homeDoc = extractDocumentFromHtml(homeHtml, finalUrl, 8000);
+    detectedLang = detectSiteLanguage({ html: homeHtml, text: homeDoc.markdown, url: finalUrl });
+    const homePC = extractPeopleAndContactsFromHtml(homeHtml, finalUrl, homeDoc.markdown);
+    if (homePC.people.length > 0) peopleLists.push(homePC.people);
+    contactLists.push(homePC.contacts);
+
     title = homeDoc.title || inputHost;
     description = homeDoc.description;
     jsonLd = homeDoc.jsonLd;
 
-    await report('homepage', 'completed', `Rendered ${title.slice(0, 60)} (${homeDoc.textLength} chars)`, 28);
+    await report('homepage', 'completed', `Rendered ${title.slice(0, 60)} (${homeDoc.textLength} chars · lang=${detectedLang.code})`, 28);
 
     pagesCrawled.push({
       url: finalUrl,
@@ -432,7 +484,7 @@ export async function runIntelligentCrawl(
     sourcePages.push(finalUrl);
 
     bucketChunks.identity.push(
-      `### HOMEPAGE (${finalUrl})\nTitle: ${title}\nMeta Description: ${description}\n\n${homeDoc.markdown}`
+      `### HOMEPAGE (${finalUrl})\nLanguage: ${detectedLang.code} (confidence=${detectedLang.confidence})\nTitle: ${title}\nMeta Description: ${description}\n\n${homeDoc.markdown}`
     );
     if (Object.keys(jsonLd).length > 0) {
       bucketChunks.identity.push(`Structured Schema.org Data:\n\`\`\`json\n${JSON.stringify(jsonLd, null, 2)}\n\`\`\``);
@@ -442,8 +494,9 @@ export async function runIntelligentCrawl(
     const effParsed = new URL(finalUrl);
     const effHost = effParsed.hostname;
     const baseOrigin = `${effParsed.protocol}//${effHost}`;
+    const acceptLangHeader = `${detectedLang.code},en;q=0.7`;
 
-    await report('subpages', 'running', 'Discovering sitemap & high-signal subpages...', 38);
+    await report('subpages', 'running', `Discovering sitemap & key (${detectedLang.code}) subpages...`, 38);
 
     const candidatesByUrl = new Map<string, { url: string; bucket: string; score: number }>();
     const normalizedHome = finalUrl.replace(/\/$/, '');
@@ -477,12 +530,14 @@ export async function runIntelligentCrawl(
     }
 
     const byBucket: Record<string, Array<{ url: string; bucket: string; score: number }>> = {
-      identity: [],
-      product: [],
-      pricing: [],
-      proof: [],
+      leadership: [],
+      about: [],
+      products_services: [],
+      contact: [],
+      customers: [],
       news_blog: [],
       general: [],
+      careers: [],
     };
     for (const cand of candidatesByUrl.values()) {
       (byBucket[cand.bucket] || byBucket.general).push(cand);
@@ -491,7 +546,16 @@ export async function runIntelligentCrawl(
       list.sort((a, b) => b.score - a.score);
     }
 
-    const bucketOrder = ['identity', 'product', 'pricing', 'proof', ...(includeBlogNews ? ['news_blog'] : []), 'general'];
+    const bucketOrder = [
+      'leadership',
+      'about',
+      'products_services',
+      'contact',
+      ...(includeBlogNews ? ['news_blog'] : []),
+      'customers',
+      'general',
+      'careers',
+    ];
     const selectedToCrawl: Array<{ url: string; bucket: string; score: number }> = [];
     while (selectedToCrawl.length < maxPages - 1) {
       let added = false;
@@ -508,25 +572,32 @@ export async function runIntelligentCrawl(
 
     const newsHubHtmls: Array<{ url: string; html: string }> = [];
 
-    // Fetch subpages in parallel batches of 4 via fast fetch(); fall back to Playwright ONLY for empty JS shells
+    // Fetch subpages in parallel via fast fetch(); fall back to Playwright for JS shells or empty news hubs
     const subResults = await Promise.all(
       selectedToCrawl.map(async (target) => {
-        const res = await fastFetch(target.url, 6500);
+        const res = await fastFetch(target.url, 6500, 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', acceptLangHeader);
         let htmlBody = res.ok ? res.body : '';
         let method: 'fetch' | 'playwright' = 'fetch';
 
         let doc = htmlBody ? extractDocumentFromHtml(htmlBody, res.finalUrl || target.url, 4500) : null;
-        if (!doc || doc.textLength < 220) {
-          // Optional single Playwright fallback for JS-rendered key pages (cap to identity/product/proof)
-          if (['identity', 'product', 'pricing', 'proof'].includes(target.bucket)) {
+        const needsNewsJsRender =
+          target.bucket === 'news_blog' &&
+          options.render_js !== false &&
+          (!htmlBody || extractNewsArticleLinksFromHtml(htmlBody, target.url, 4).articleUrls.length === 0);
+
+        if (!doc || doc.textLength < 220 || needsNewsJsRender) {
+          if (['leadership', 'about', 'contact', 'products_services', 'customers', 'news_blog'].includes(target.bucket)) {
             try {
               await withPage(async (p) => {
                 const r = await p.goto(target.url, { waitUntil: 'domcontentloaded' }).catch(() => null);
                 if (r && r.status() >= 200 && r.status() < 400) {
-                  await p.waitForLoadState('networkidle', { timeout: 2500 }).catch(() => {});
-                  htmlBody = await p.content();
-                  doc = extractDocumentFromHtml(htmlBody, p.url() || target.url, 4500);
-                  method = 'playwright';
+                  await p.waitForLoadState('networkidle', { timeout: 2800 }).catch(() => {});
+                  const rendered = await p.content();
+                  if (rendered && rendered.length > htmlBody.length * 0.6) {
+                    htmlBody = rendered;
+                    doc = extractDocumentFromHtml(htmlBody, p.url() || target.url, 4500);
+                    method = 'playwright';
+                  }
                 }
               });
             } catch {
@@ -540,7 +611,13 @@ export async function runIntelligentCrawl(
     );
 
     for (const item of subResults) {
-      if (!item.doc || item.doc.textLength < 100) continue;
+      if (item.htmlBody) {
+        const subPC = extractPeopleAndContactsFromHtml(item.htmlBody, item.target.url, item.doc?.markdown || '');
+        if (subPC.people.length > 0) peopleLists.push(subPC.people);
+        contactLists.push(subPC.contacts);
+      }
+
+      if (!item.doc || item.doc.textLength < 90) continue;
       const subTitle = item.doc.title || item.target.bucket;
       pagesCrawled.push({
         url: item.target.url,
@@ -553,8 +630,8 @@ export async function runIntelligentCrawl(
       });
       sourcePages.push(item.target.url);
 
-      if (item.target.bucket === 'identity') {
-        bucketChunks.identity.push(`### ${subTitle} (${item.target.url})\n\n${item.doc.markdown}`);
+      if (['about', 'leadership', 'contact', 'careers'].includes(item.target.bucket)) {
+        bucketChunks.identity.push(`### [${item.target.bucket.toUpperCase()}] ${subTitle} (${item.target.url})\n\n${item.doc.markdown}`);
       } else if (item.target.bucket === 'news_blog') {
         bucketChunks.news_blog.push(`### ${subTitle} (${item.target.url})\n\n${item.doc.markdown}`);
         if (item.htmlBody) newsHubHtmls.push({ url: item.target.url, html: item.htmlBody });
@@ -567,17 +644,21 @@ export async function runIntelligentCrawl(
 
     await report('subpages', 'completed', `Crawled ${pagesCrawled.length} pages total`, 58);
 
-    // Step 4: Blog RSS & Article Scraping
+    // Step 4: Blog RSS & Article Scraping (Multilingual hub discovery + inline fallback)
     if (includeBlogNews) {
-      await report('blog_rss', 'running', 'Scanning company blog & RSS feeds...', 64);
+      await report('blog_rss', 'running', 'Scanning company blog, news hubs & RSS feeds...', 64);
+      const hubFeedHints = newsHubHtmls.flatMap((h) => {
+        const cleanHub = h.url.replace(/\/$/, '');
+        return [`${cleanHub}/feed`, `${cleanHub}/rss.xml`];
+      });
       const feedUrls =
         homeDoc.rssFeeds.length > 0
-          ? homeDoc.rssFeeds
-          : [`${baseOrigin}/feed`, `${baseOrigin}/rss.xml`, `${baseOrigin}/blog/rss.xml`];
+          ? [...homeDoc.rssFeeds, ...hubFeedHints]
+          : [...hubFeedHints, `${baseOrigin}/feed`, `${baseOrigin}/rss.xml`, `${baseOrigin}/blog/rss.xml`];
 
-      for (const fUrl of Array.from(new Set(feedUrls)).slice(0, 3)) {
+      for (const fUrl of Array.from(new Set(feedUrls)).slice(0, 4)) {
         if (articles.length >= maxArticles) break;
-        const fRes = await fastFetch(fUrl, 4000, 'application/rss+xml,application/atom+xml,application/xml,text/xml');
+        const fRes = await fastFetch(fUrl, 4000, 'application/rss+xml,application/atom+xml,application/xml,text/xml', acceptLangHeader);
         if (fRes.ok && (fRes.body.includes('<rss') || fRes.body.includes('<feed'))) {
           const parsedFeed = parseRssOrAtomXml(fRes.body, maxArticles - articles.length);
           for (const a of parsedFeed) {
@@ -586,39 +667,75 @@ export async function runIntelligentCrawl(
         }
       }
 
+      // If no dedicated news_blog subpage was selected, check homepage links for news/article URLs directly
+      if (newsHubHtmls.length === 0) {
+        newsHubHtmls.push({ url: finalUrl, html: homeHtml });
+      }
+
       if (articles.length < maxArticles && newsHubHtmls.length > 0) {
-        const artCandidates = new Map<string, string>();
+        const seenArtUrls = new Set<string>(sourcePages);
+        const targetArtUrls: Array<{ url: string; fallbackItem?: ArticleItem }> = [];
+        const inlineFallbackMap = new Map<string, ArticleItem>();
+
         for (const hub of newsHubHtmls) {
-          const hubDoc = extractDocumentFromHtml(hub.html, hub.url, 500);
-          for (const lnk of hubDoc.links) {
-            if (sourcePages.includes(lnk.url)) continue;
-            try {
-              const u = new URL(lnk.url);
-              if (u.hostname.toLowerCase() !== effHost.toLowerCase()) continue;
-              if (/\/(blog|news|newsroom|press|insights|articles)\/[a-z0-9\-_]{5,}/i.test(u.pathname)) {
-                artCandidates.set(lnk.url, lnk.anchor);
-              }
-            } catch {
-              continue;
-            }
+          const extracted = extractNewsArticleLinksFromHtml(hub.html, hub.url, Math.max(8, maxArticles * 3));
+          for (const inline of extracted.inlineItems) {
+            inlineFallbackMap.set(inline.url, inline);
+          }
+          for (const artUrl of extracted.articleUrls) {
+            if (seenArtUrls.has(artUrl)) continue;
+            seenArtUrls.add(artUrl);
+            targetArtUrls.push({ url: artUrl, fallbackItem: inlineFallbackMap.get(artUrl) });
           }
         }
 
-        const targets = Array.from(artCandidates.entries()).slice(0, maxArticles - articles.length);
+        const targets = targetArtUrls.slice(0, maxArticles - articles.length);
         const fetchedArts = await Promise.all(
-          targets.map(async ([artUrl, anchor]) => {
-            const aRes = await fastFetch(artUrl, 5000);
-            if (!aRes.ok || !aRes.body) return null;
-            const aDoc = extractDocumentFromHtml(aRes.body, artUrl, 2400);
-            if (aDoc.textLength < 120) return null;
-            return {
-              title: aDoc.title || anchor || 'Article',
-              url: artUrl,
-              published_at: '',
-              source: 'company_blog_page',
-              summary: aDoc.markdown,
-              chars: aDoc.textLength,
-            };
+          targets.map(async (entry) => {
+            const aRes = await fastFetch(entry.url, 5500, 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', acceptLangHeader);
+            let aBody = aRes.ok ? aRes.body : '';
+            let aMethod: 'fetch' | 'playwright' = 'fetch';
+            let aDoc = aBody ? extractDocumentFromHtml(aBody, entry.url, 3200) : null;
+
+            if ((!aDoc || aDoc.textLength < 140) && options.render_js !== false) {
+              try {
+                await withPage(async (p) => {
+                  const r = await p.goto(entry.url, { waitUntil: 'domcontentloaded' }).catch(() => null);
+                  if (r && r.status() >= 200 && r.status() < 400) {
+                    await p.waitForLoadState('networkidle', { timeout: 2200 }).catch(() => {});
+                    aBody = await p.content();
+                    aDoc = extractDocumentFromHtml(aBody, p.url() || entry.url, 3200);
+                    aMethod = 'playwright';
+                  }
+                });
+              } catch {
+                // fall back to inline card summary if present
+              }
+            }
+
+            if (aDoc && aDoc.textLength >= 110) {
+              return {
+                title: aDoc.title || entry.fallbackItem?.title || 'Article',
+                url: entry.url,
+                published_at: entry.fallbackItem?.published_at || '',
+                source: 'company_blog_page',
+                summary: aDoc.markdown,
+                chars: aDoc.textLength,
+                method: aMethod,
+              };
+            }
+            if (entry.fallbackItem && (entry.fallbackItem.summary.length >= 25 || entry.fallbackItem.title.length >= 12)) {
+              return {
+                title: entry.fallbackItem.title,
+                url: entry.url,
+                published_at: entry.fallbackItem.published_at,
+                source: 'company_blog_hub_card',
+                summary: entry.fallbackItem.summary || entry.fallbackItem.title,
+                chars: (entry.fallbackItem.summary || entry.fallbackItem.title).length,
+                method: 'fetch' as const,
+              };
+            }
+            return null;
           })
         );
 
@@ -636,7 +753,8 @@ export async function runIntelligentCrawl(
             category: 'article',
             title: fa.title,
             chars: fa.chars,
-            method: 'fetch',
+            method: fa.method,
+            markdown: fa.summary,
           });
           sourcePages.push(fa.url);
         }
@@ -647,10 +765,10 @@ export async function runIntelligentCrawl(
     }
   }
 
-  // Step 5: External Press & News (ALWAYS runs even if website returned 403!)
+  // Step 5: External Press & News (localized to detected language + ccTLD, ALWAYS runs even if website returned 403!)
   if (includeExternalNews) {
-    await report('external_news', 'running', 'Fetching recent press & external news...', 75);
-    externalNews = await fetchGoogleNews(companyName, inputHost, 5);
+    await report('external_news', 'running', `Fetching recent press & external news (${detectedLang.googleNews.ceid})...`, 75);
+    externalNews = await fetchGoogleNews(companyName, inputHost, 5, detectedLang.code);
     await report(
       'external_news',
       externalNews.length > 0 ? 'completed' : 'warning',
@@ -660,6 +778,10 @@ export async function runIntelligentCrawl(
   } else {
     await report('external_news', 'skipped', 'Disabled in scraper settings', 82);
   }
+
+  // Merge discovered people & contacts across homepage + team/about/contact pages
+  const people = mergePeopleLists(peopleLists);
+  const contacts = mergeContactsLists(contactLists);
 
   // Step 6: Assemble structured Markdown episodes
   const episodes: EpisodePayload[] = [];
@@ -686,6 +808,39 @@ export async function runIntelligentCrawl(
       source_type: 'website_products_proof',
       occurred_at: nowIso,
       content: bucketChunks.product_pricing_proof.join('\n\n---\n\n').slice(0, 15000),
+    });
+  }
+
+  if (
+    people.length > 0 ||
+    contacts.emails.length > 0 ||
+    contacts.phones.length > 0 ||
+    contacts.social_links.length > 0 ||
+    contacts.addresses.length > 0
+  ) {
+    const contactSections: string[] = [];
+    if (contacts.emails.length > 0) contactSections.push(`Emails: ${contacts.emails.join(', ')}`);
+    if (contacts.phones.length > 0) contactSections.push(`Phones: ${contacts.phones.join(', ')}`);
+    if (contacts.social_links.length > 0) contactSections.push(`Social Profiles: ${contacts.social_links.join(', ')}`);
+    if (contacts.addresses.length > 0) contactSections.push(`Addresses: ${contacts.addresses.join(' | ')}`);
+
+    const peopleLines = people.map((p) => {
+      const parts = [p.role, p.email, p.phone, p.linkedin_url].filter(Boolean);
+      return `- **${p.name}**${parts.length > 0 ? ` — ${parts.join(' | ')}` : ''}${p.bio ? `\n  ${p.bio}` : ''}`;
+    });
+
+    const bodyParts: string[] = [];
+    if (peopleLines.length > 0) bodyParts.push(`Leadership & Team Contacts Discovered:\n\n${peopleLines.join('\n')}`);
+    if (contactSections.length > 0) bodyParts.push(`Public Contact Channels:\n${contactSections.join('\n')}`);
+
+    episodes.push({
+      key: 'company_people_contacts',
+      category: 'people',
+      title: 'Key People, Leadership & Public Contact Channels',
+      url: finalUrl,
+      source_type: 'website_team_contacts',
+      occurred_at: nowIso,
+      content: bodyParts.join('\n\n').slice(0, 14000),
     });
   }
 
@@ -746,6 +901,11 @@ export async function runIntelligentCrawl(
     markdown: combinedMarkdown,
     brand_kit: brandKit,
     json_ld: jsonLd,
+    detected_language: detectedLang.code,
+    detected_language_confidence: detectedLang.confidence,
+    detected_language_source: detectedLang.source,
+    people,
+    contacts,
     pages_crawled: pagesCrawled,
     articles,
     external_news: externalNews,

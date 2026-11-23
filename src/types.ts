@@ -56,6 +56,23 @@ export interface ArticleItem {
   summary: string;
 }
 
+export interface ScrapedPerson {
+  name: string;
+  role?: string;
+  email?: string;
+  phone?: string;
+  linkedin_url?: string;
+  source_url?: string;
+  bio?: string;
+}
+
+export interface ScrapedContacts {
+  emails: string[];
+  phones: string[];
+  social_links: string[];
+  addresses: string[];
+}
+
 export interface EpisodePayload {
   key: string;
   category: string;
@@ -104,6 +121,11 @@ export interface CrawlResult {
   markdown: string;
   brand_kit: BrandKit | null;
   json_ld: Record<string, unknown>;
+  detected_language?: string;
+  detected_language_confidence?: number;
+  detected_language_source?: string;
+  people?: ScrapedPerson[];
+  contacts?: ScrapedContacts;
   pages_crawled: CrawledPage[];
   articles: ArticleItem[];
   external_news: ArticleItem[];
