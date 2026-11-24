@@ -62,6 +62,10 @@ export interface ScrapedPerson {
   email?: string;
   phone?: string;
   linkedin_url?: string;
+  x_url?: string;
+  source?: 'json_ld' | 'website_team' | 'impressum' | 'ares_vr';
+  is_decision_maker?: boolean;
+  seniority_score?: number;
   source_url?: string;
   bio?: string;
 }
@@ -71,6 +75,27 @@ export interface ScrapedContacts {
   phones: string[];
   social_links: string[];
   addresses: string[];
+  company_ico?: string;
+  company_dic?: string;
+  linkedin_company_url?: string;
+  x_url?: string;
+  x_handle?: string;
+  facebook_url?: string;
+  instagram_url?: string;
+  youtube_url?: string;
+  github_url?: string;
+}
+
+export interface RegistryData {
+  source: 'cz_ares';
+  ico: string;
+  dic?: string;
+  legal_name: string;
+  legal_form?: string;
+  founded_at?: string;
+  address?: string;
+  nace_codes?: string[];
+  executives: ScrapedPerson[];
 }
 
 export interface EpisodePayload {
@@ -98,6 +123,7 @@ export interface CrawlOptions {
   include_sitemap?: boolean;
   include_blog_and_news?: boolean;
   include_external_news?: boolean;
+  include_cz_ares?: boolean;
   extract_brand?: boolean;
   render_js?: boolean;
   profile_header?: string;
@@ -126,6 +152,7 @@ export interface CrawlResult {
   detected_language_source?: string;
   people?: ScrapedPerson[];
   contacts?: ScrapedContacts;
+  registry?: RegistryData | null;
   pages_crawled: CrawledPage[];
   articles: ArticleItem[];
   external_news: ArticleItem[];

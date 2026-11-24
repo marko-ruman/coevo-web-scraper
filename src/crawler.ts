@@ -1,6 +1,7 @@
 import { withPage } from './browser.js';
 import { extractBrandKitFromPage } from './brand.js';
 import {
+  enrichPeopleWithSiteEmails,
   extractNewsArticleLinksFromHtml,
   extractPeopleAndContactsFromHtml,
   mergeContactsLists,
@@ -19,6 +20,7 @@ import {
   normalizeUrl,
   resolveRelativeUrl,
 } from './markdown.js';
+import { lookupCzechAres } from './registries.js';
 import type {
   ArticleItem,
   BrandKit,
@@ -26,6 +28,7 @@ import type {
   CrawlOptions,
   CrawlResult,
   EpisodePayload,
+  RegistryData,
   ScrapedContacts,
   ScrapedPerson,
   ScrapeOptions,
@@ -376,6 +379,7 @@ export async function runIntelligentCrawl(
   const includeBlogNews = options.include_blog_and_news !== false;
   const includeExternalNews = options.include_external_news !== false;
   const extractBrand = options.extract_brand !== false;
+  const includeCzAres = options.include_cz_ares !== false;
   const companyName = (options.name || '').trim();
 
   // Step 1: Render Homepage & Extract Brand Kit (Playwright)
@@ -442,6 +446,7 @@ export async function runIntelligentCrawl(
   let externalNews: ArticleItem[] = [];
   const peopleLists: ScrapedPerson[][] = [];
   const contactLists: ScrapedContacts[] = [];
+  const legalContactFallbackUrls: Array<{ url: string; priority: number }> = [];
   const bucketChunks: Record<'identity' | 'product_pricing_proof' | 'news_blog', string[]> = {
     identity: [],
     product_pricing_proof: [],
@@ -510,6 +515,16 @@ export async function runIntelligentCrawl(
       }
       const clean = lnk.url.replace(/\/$/, '');
       if (!clean || clean === normalizedHome) continue;
+      if (/\/(?:impressum|kontakt|contact|obchodni-podminky|gdpr|ochrana-udaju|datenschutz|mentions-legales)\b/i.test(clean)) {
+        const priority = /impressum/i.test(clean)
+          ? 100
+          : /kontakt|contact/i.test(clean)
+            ? 85
+            : /obchodni-podminky|datenschutz|mentions-legales/i.test(clean)
+              ? 70
+              : 55;
+        legalContactFallbackUrls.push({ url: clean, priority });
+      }
       const cls = classifyPageBucket(clean, lnk.anchor);
       if (cls.bucket === 'excluded') continue;
       const prev = candidatesByUrl.get(clean);
@@ -522,7 +537,18 @@ export async function runIntelligentCrawl(
       const smUrls = await fetchSitemapUrls(baseOrigin, effHost);
       for (const smUrl of smUrls) {
         const clean = smUrl.split('#')[0].replace(/\/$/, '');
-        if (!clean || clean === normalizedHome || candidatesByUrl.has(clean)) continue;
+        if (!clean || clean === normalizedHome) continue;
+        if (/\/(?:impressum|kontakt|contact|obchodni-podminky|gdpr|ochrana-udaju|datenschutz|mentions-legales)\b/i.test(clean)) {
+          const priority = /impressum/i.test(clean)
+            ? 100
+            : /kontakt|contact/i.test(clean)
+              ? 85
+              : /obchodni-podminky|datenschutz|mentions-legales/i.test(clean)
+                ? 70
+                : 55;
+          legalContactFallbackUrls.push({ url: clean, priority });
+        }
+        if (candidatesByUrl.has(clean)) continue;
         const cls = classifyPageBucket(clean, '');
         if (cls.bucket === 'excluded') continue;
         candidatesByUrl.set(clean, { url: clean, bucket: cls.bucket, score: cls.score });
@@ -639,6 +665,36 @@ export async function runIntelligentCrawl(
         bucketChunks.product_pricing_proof.push(
           `### [${item.target.bucket.toUpperCase()}] ${subTitle} (${item.target.url})\n\n${item.doc.markdown}`
         );
+      }
+    }
+
+    const crawledUrlSet = new Set(sourcePages.map((u) => u.replace(/\/$/, '').toLowerCase()));
+    const interimContacts = mergeContactsLists(contactLists);
+    const hasImpressumExec = peopleLists.some((lst) => lst.some((p) => p.source === 'impressum'));
+
+    if ((!interimContacts.company_ico || !hasImpressumExec) && legalContactFallbackUrls.length > 0) {
+      const rankedFallback = legalContactFallbackUrls
+        .filter((f) => !crawledUrlSet.has(f.url.toLowerCase()))
+        .sort((a, b) => b.priority - a.priority);
+      const fallbackTarget = rankedFallback[0];
+      if (fallbackTarget) {
+        const legalRes = await fastFetch(
+          fallbackTarget.url,
+          5500,
+          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          acceptLangHeader
+        );
+        if (legalRes.ok && legalRes.body) {
+          const legalDoc = extractDocumentFromHtml(legalRes.body, legalRes.finalUrl || fallbackTarget.url, 3200);
+          const legalPC = extractPeopleAndContactsFromHtml(
+            legalRes.body,
+            legalRes.finalUrl || fallbackTarget.url,
+            legalDoc.markdown
+          );
+          if (legalPC.people.length > 0) peopleLists.push(legalPC.people);
+          contactLists.push(legalPC.contacts);
+          sourcePages.push(legalRes.finalUrl || fallbackTarget.url);
+        }
       }
     }
 
@@ -779,9 +835,53 @@ export async function runIntelligentCrawl(
     await report('external_news', 'skipped', 'Disabled in scraper settings', 82);
   }
 
-  // Merge discovered people & contacts across homepage + team/about/contact pages
-  const people = mergePeopleLists(peopleLists);
+  // Merge discovered people & contacts across homepage + team/about/contact/impressum pages
+  let people = mergePeopleLists(peopleLists);
   const contacts = mergeContactsLists(contactLists);
+
+  // Lookup Czech ARES public business registry when IČO is present or site is Czech (.cz / cs)
+  let registryData: RegistryData | null = null;
+  let effectiveHost = inputHost;
+  try {
+    effectiveHost = new URL(finalUrl).hostname || inputHost;
+  } catch {
+    // keep inputHost
+  }
+
+  const ldCompanyName =
+    typeof (jsonLd as any)?.legalName === 'string'
+      ? (jsonLd as any).legalName
+      : typeof (jsonLd as any)?.name === 'string'
+        ? (jsonLd as any).name
+        : '';
+
+  if (includeCzAres && (contacts.company_ico || effectiveHost.endsWith('.cz') || detectedLang.code === 'cs')) {
+    registryData = await lookupCzechAres({
+      ico: contacts.company_ico,
+      companyName: ldCompanyName || companyName || title,
+      host: effectiveHost,
+      detectedLang: detectedLang.code,
+    });
+  }
+
+  if (registryData) {
+    if (!contacts.company_ico && registryData.ico) contacts.company_ico = registryData.ico;
+    if (!contacts.company_dic && registryData.dic) contacts.company_dic = registryData.dic;
+    if (registryData.address && !contacts.addresses.includes(registryData.address)) {
+      contacts.addresses = Array.from(new Set([...contacts.addresses, registryData.address])).slice(0, 15);
+    }
+    if (registryData.executives.length > 0) {
+      people = mergePeopleLists([people, registryData.executives]);
+    }
+  }
+
+  // Match personal emails discovered anywhere on the site onto team / ARES executives
+  people = enrichPeopleWithSiteEmails(people, contacts.emails);
+
+  const resolvedBrandKit = brandKit as BrandKit | null;
+  if (resolvedBrandKit && !resolvedBrandKit.linkedin_company_url && contacts.linkedin_company_url) {
+    resolvedBrandKit.linkedin_company_url = contacts.linkedin_company_url;
+  }
 
   // Step 6: Assemble structured Markdown episodes
   const episodes: EpisodePayload[] = [];
@@ -816,16 +916,22 @@ export async function runIntelligentCrawl(
     contacts.emails.length > 0 ||
     contacts.phones.length > 0 ||
     contacts.social_links.length > 0 ||
-    contacts.addresses.length > 0
+    contacts.addresses.length > 0 ||
+    contacts.company_ico
   ) {
     const contactSections: string[] = [];
+    if (contacts.company_ico) {
+      contactSections.push(`Registry IDs: IČO ${contacts.company_ico}${contacts.company_dic ? ` · DIČ ${contacts.company_dic}` : ''}`);
+    }
     if (contacts.emails.length > 0) contactSections.push(`Emails: ${contacts.emails.join(', ')}`);
     if (contacts.phones.length > 0) contactSections.push(`Phones: ${contacts.phones.join(', ')}`);
+    if (contacts.x_url) contactSections.push(`X: ${contacts.x_url}${contacts.x_handle ? ` (${contacts.x_handle})` : ''}`);
     if (contacts.social_links.length > 0) contactSections.push(`Social Profiles: ${contacts.social_links.join(', ')}`);
     if (contacts.addresses.length > 0) contactSections.push(`Addresses: ${contacts.addresses.join(' | ')}`);
 
     const peopleLines = people.map((p) => {
-      const parts = [p.role, p.email, p.phone, p.linkedin_url].filter(Boolean);
+      const sourceTag = p.source === 'ares_vr' ? '[ARES Verified]' : p.source === 'impressum' ? '[Impressum]' : '';
+      const parts = [sourceTag, p.role, p.email, p.phone, p.linkedin_url, p.x_url].filter(Boolean);
       return `- **${p.name}**${parts.length > 0 ? ` — ${parts.join(' | ')}` : ''}${p.bio ? `\n  ${p.bio}` : ''}`;
     });
 
@@ -841,6 +947,32 @@ export async function runIntelligentCrawl(
       source_type: 'website_team_contacts',
       occurred_at: nowIso,
       content: bodyParts.join('\n\n').slice(0, 14000),
+    });
+  }
+
+  if (registryData) {
+    const regLines: string[] = [
+      `Legal Name: ${registryData.legal_name}`,
+      `IČO: ${registryData.ico}${registryData.dic ? ` · DIČ: ${registryData.dic}` : ''}`,
+    ];
+    if (registryData.legal_form) regLines.push(`Legal Form: ${registryData.legal_form}`);
+    if (registryData.founded_at) regLines.push(`Founded: ${registryData.founded_at}`);
+    if (registryData.address) regLines.push(`Registered Address: ${registryData.address}`);
+    if (registryData.nace_codes?.length) regLines.push(`CZ-NACE Activities: ${registryData.nace_codes.join(', ')}`);
+    if (registryData.executives.length > 0) {
+      regLines.push(
+        `\nStatutory Executives & Owners (ARES VR):\n` +
+          registryData.executives.map((ex) => `- **${ex.name}**${ex.role ? ` — ${ex.role}` : ''}`).join('\n')
+      );
+    }
+    episodes.push({
+      key: 'company_registry',
+      category: 'registry',
+      title: 'Official Business Registry Record (Czech ARES)',
+      url: `https://ares.gov.cz/ekonomicke-subjekty?ico=${registryData.ico}`,
+      source_type: 'business_registry',
+      occurred_at: nowIso,
+      content: regLines.join('\n').slice(0, 10000),
     });
   }
 
@@ -906,6 +1038,7 @@ export async function runIntelligentCrawl(
     detected_language_source: detectedLang.source,
     people,
     contacts,
+    registry: registryData,
     pages_crawled: pagesCrawled,
     articles,
     external_news: externalNews,
